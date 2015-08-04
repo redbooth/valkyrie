@@ -1,0 +1,502 @@
+From de375e4963ae6a7188dd20d1b5f81e45ad918208 Mon Sep 17 00:00:00 2001
+From: vagrant <vagrant@buildbox>
+Date: Wed, 29 Jul 2015 22:27:20 +0000
+Subject: [PATCH] net-splice from philhofer/go
+
+---
+ src/net/sendfile_linux.go |  30 +++++++
+ src/net/splice_linux.go   | 206 ++++++++++++++++++++++++++++++++++++++++++++
+ src/net/splice_test.go    | 213 ++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 449 insertions(+)
+ create mode 100644 src/net/splice_linux.go
+ create mode 100644 src/net/splice_test.go
+
+diff --git a/src/net/sendfile_linux.go b/src/net/sendfile_linux.go
+index 5e11763..4e8fa7c 100644
+--- a/src/net/sendfile_linux.go
++++ b/src/net/sendfile_linux.go
+@@ -14,6 +14,23 @@ import (
+ // at a time.
+ const maxSendfileSize int = 4 << 20
+ 
++// is this a socket?
++func getFd(r io.Reader) (*netFD, bool) {
++	switch r := r.(type) {
++	case *UnixConn:
++		return r.fd, true
++	case *TCPConn:
++		return r.fd, true
++
++	// TODO(pmh/maybe): support
++	// for UDPConn under certain
++	// circumstances.
++
++	default:
++		return nil, false
++	}
++}
++
+ // sendFile copies the contents of r to c using the sendfile
+ // system call to minimize copies.
+ //
+@@ -24,13 +41,26 @@ const maxSendfileSize int = 4 << 20
+ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
+ 	var remain int64 = 1 << 62 // by default, copy until EOF
+ 
++	isFixed := false
+ 	lr, ok := r.(*io.LimitedReader)
+ 	if ok {
++		isFixed = true
+ 		remain, r = lr.N, lr.R
+ 		if remain <= 0 {
+ 			return 0, nil, true
+ 		}
+ 	}
++
++	// if this is a network connection,
++	// we can use splice
++	if nfd, ok := getFd(r); ok {
++		amt := int64(-1)
++		if isFixed {
++			amt = remain
++		}
++		return splice(c, nfd, amt)
++	}
++
+ 	f, ok := r.(*os.File)
+ 	if !ok {
+ 		return 0, nil, false
+diff --git a/src/net/splice_linux.go b/src/net/splice_linux.go
+new file mode 100644
+index 0000000..754e9d8
+--- /dev/null
++++ b/src/net/splice_linux.go
+@@ -0,0 +1,206 @@
++// Copyright 2015 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build linux
++
++package net
++
++import (
++	"io"
++	"os"
++	"syscall"
++)
++
++const (
++	// SPLICE_F_MOVE hints to the kernel to
++	// move page references rather than memory.
++	fSpliceMove = 0x01
++
++	// NOTE: SPLICE_F_NONBLOCK only makes the pipe operations
++	// non-blocking. A pipe operation could still block if the
++	// underlying fd was set to blocking. Conversely, a call
++	// to splice() without SPLICE_F_NONBLOCK can still return
++	// EAGAIN if the non-pipe fd is non-blocking.
++	fSpliceNonblock = 0x02
++
++	// SPLICE_F_MORE hints that more data will be sent
++	// (see: TCP_CORK).
++	fSpliceMore = 0x04
++
++	// In *almost* all Linux kernels, pipes are this size,
++	// so we can use it as a size hint when filling a pipe.
++	pipeBuf = 65535
++)
++
++func splice(dst *netFD, src *netFD, amt int64) (int64, error, bool) {
++	if err := dst.writeLock(); err != nil {
++		return 0, err, true
++	}
++	defer dst.writeUnlock()
++	if err := src.readLock(); err != nil {
++		return 0, err, true
++	}
++	defer src.readUnlock()
++
++	var sp splicePipe
++	if err := sp.init(amt); err != nil {
++		// In the event that pipe2 isn't
++		// supported, bail out.
++		return 0, err, err != syscall.ENOSYS
++	}
++
++	var err error
++	for err == nil && sp.toread != 0 {
++		err = sp.readFrom(src)
++		if err != nil {
++			break
++		}
++		err = sp.writeTo(dst)
++	}
++	err1 := sp.flush(dst)
++	if err == nil {
++		err = err1
++	}
++	if err != nil {
++		err = os.NewSyscallError("splice", err)
++	}
++	closerr := sp.destroy()
++	if err == nil {
++		err = closerr
++	}
++	return sp.written, err, true
++}
++
++type splicePipe struct {
++	toread  int64 // bytes to read (<0 if unlimited)
++	written int64 // bytes written
++	rfd     int   // read fd
++	wfd     int   // write fd
++	inbuf   int64 // bytes in pipe
++}
++
++// init opens the pipe and sets the max read counter
++func (s *splicePipe) init(max int64) error {
++	var pipefd [2]int
++	err := syscall.Pipe2(pipefd[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK)
++	if err != nil {
++		return err
++	}
++	s.rfd = pipefd[0]
++	s.wfd = pipefd[1]
++	s.toread = max
++	return nil
++}
++
++func (s *splicePipe) destroy() error {
++	err := syscall.Close(s.rfd)
++	err1 := syscall.Close(s.wfd)
++	if err == nil {
++		return err1
++	}
++	return err
++}
++
++// readFrom tries to splice data from 'src'
++// into the pipe, but may no-op if the pipe is
++// full or the read limit has been reached.
++func (s *splicePipe) readFrom(src *netFD) error {
++	if s.toread == 0 {
++		return nil
++	}
++
++	amt := pipeBuf - s.inbuf
++	if s.toread > 0 && s.toread < amt {
++		amt = s.toread
++	}
++
++	// we have to differentiate
++	// between blocking on read(socket)
++	// and write(pipe), since both can
++	// return EAGAIN
++	canRead := false
++read:
++	// The socket->pipe splice *must* be SPLICE_F_NONBLOCK,
++	// because if the pipe write blocks, then we'll deadlock.
++	n, eno := rawsplice(src.sysfd, s.wfd, int(amt), fSpliceMove|fSpliceMore|fSpliceNonblock)
++	if eno == syscall.EAGAIN {
++		if canRead {
++			// we must be blocking b/c
++			// the pipe is full
++			return nil
++		}
++		if err := src.pd.WaitRead(); err != nil {
++			return err
++		}
++		canRead = true
++		goto read
++	}
++
++	// EOF
++	if n == 0 && eno == 0 {
++		if s.toread < 0 {
++			s.toread = 0
++			return nil
++		} else {
++			return io.ErrUnexpectedEOF
++		}
++	}
++
++	var err error
++	if eno != 0 {
++		err = eno
++	}
++
++	s.inbuf += n
++	s.toread -= n
++	return err
++}
++
++// writeTo attempts to splice data from
++// the pipe into 'dst,' but may no-op
++// if there is no data in the pipe.
++func (s *splicePipe) writeTo(dst *netFD) error {
++	if s.inbuf == 0 {
++		return nil
++	}
++
++	// we don't need to set SPLICE_F_NONBLOCK,
++	// because if there's data in the pipe, then
++	// EAGAIN will only occur if the socket would block
++	flags := fSpliceMove
++	// if we have more data to write, hint w/ SPLICE_F_MORE
++	if s.toread != 0 {
++		flags |= fSpliceMore
++	}
++
++write:
++	n, eno := rawsplice(s.rfd, dst.sysfd, int(s.inbuf), flags)
++	if eno == syscall.EAGAIN {
++		if err := dst.pd.WaitWrite(); err != nil {
++			return err
++		}
++		goto write
++	}
++	var err error
++	if eno != 0 {
++		err = eno
++	}
++	s.inbuf -= n
++	s.written += n
++	return err
++}
++
++func (s *splicePipe) flush(dst *netFD) error {
++	for s.inbuf > 0 {
++		if err := s.writeTo(dst); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func rawsplice(srcfd int, dstfd int, amt int, flags int) (int64, syscall.Errno) {
++	r, _, e := syscall.RawSyscall6(syscall.SYS_SPLICE, uintptr(srcfd), 0, uintptr(dstfd), 0, uintptr(amt), uintptr(flags))
++	return int64(r), e
++}
+diff --git a/src/net/splice_test.go b/src/net/splice_test.go
+new file mode 100644
+index 0000000..93d18d7
+--- /dev/null
++++ b/src/net/splice_test.go
+@@ -0,0 +1,213 @@
++// Copyright 2015 The Go Authors.  All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// +build linux
++
++package net
++
++import (
++	"bytes"
++	"io"
++	"io/ioutil"
++	"sync"
++	"testing"
++)
++
++type onlyReader struct{ io.Reader }
++
++func sendNext2(l Listener, splice bool) error {
++	defer l.Close()
++	src, err := l.Accept()
++	if err != nil {
++		return err
++	}
++
++	dst, err := l.Accept()
++	if err != nil {
++		return err
++	}
++
++	var r io.Reader
++	if splice {
++		r = src
++	} else {
++		r = onlyReader{src}
++	}
++
++	_, err = dst.(*TCPConn).ReadFrom(r)
++	src.Close()
++	dst.Close()
++	return err
++}
++
++// returns (src, dst, dial error, listen/splice error chan)
++// on success, everything written to 'src' can be read from 'dst'
++func setupProxy(net, addr string, splice bool) (Conn, Conn, error, chan error) {
++	l, err := Listen(net, addr)
++	if err != nil {
++		return nil, nil, err, nil
++	}
++	errc := make(chan error, 1)
++	go func() {
++		errc <- sendNext2(l, splice)
++	}()
++	c1, err := Dial(net, addr)
++	if err != nil {
++		return nil, nil, err, errc
++	}
++	c2, err := Dial(net, addr)
++	if err != nil {
++		c1.Close()
++		return nil, nil, err, errc
++	}
++	return c1, c2, nil, errc
++}
++
++func TestSimpleSplice(t *testing.T) {
++	c1, c2, err, errc := setupProxy("tcp", ":7000", true)
++	if err != nil {
++		t.Fatal("setup error:", err)
++	}
++
++	select {
++	case err = <-errc:
++		t.Fatal("setup error:", err)
++	default:
++	}
++
++	// now everthing going into c1 should come out of c2
++	var n int
++	msg := []byte("TCP SPLICE TEST! WHEEEEEEEE")
++	n, err = c1.Write(msg)
++	if err != nil {
++		t.Error("from src.Write:", err)
++	}
++	if n != len(msg) {
++		t.Errorf("src.Write: short write; wrote %d bytes, but expected %d", n, len(msg))
++	}
++	out := make([]byte, len(msg))
++	_, err = c2.Read(out)
++	if err != nil {
++		t.Error("from dst.Read:", err)
++	} else {
++		if !bytes.Equal(msg, out) {
++			t.Errorf("TCP splice test: put %s in; got %s out", msg, out)
++		}
++	}
++	c1.Close()
++	c2.Close()
++	err = <-errc
++	if err != nil {
++		t.Error("from splice:", err)
++	}
++}
++
++func TestSpliceMultipart(t *testing.T) {
++	c1, c2, err, errc := setupProxy("tcp", ":7001", true)
++	if err != nil {
++		t.Fatal("setup error:", err)
++	}
++	select {
++	case err = <-errc:
++		t.Fatal("setup error:", err)
++	default:
++	}
++	part1 := []byte("this is the first part of the message!")
++	part2 := []byte("this is the second part of the message!")
++
++	var n int
++	n, err = c1.Write(part1)
++	if err != nil {
++		t.Error("src.Write:", err)
++	}
++	if n != len(part1) {
++		t.Errorf("c1.Write: short write; wrote %d bytes but expected %d", n, len(part1))
++	}
++	n, err = c1.Write(part2)
++	if err != nil {
++		t.Error("src.Write:", err)
++	}
++	if n != len(part2) {
++		t.Errorf("c2.Write: short write; wrote %d bytes but expected %d", n, len(part2))
++	}
++	out := make([]byte, len(part1)+len(part2))
++	_, err = io.ReadFull(c2, out)
++	if err != nil {
++		t.Error("src.Read:", err)
++	}
++	expected := append(part1, part2...)
++	if !bytes.Equal(out, expected) {
++		t.Errorf("put %q and %q in, but got %q out", part1, part2, out)
++	}
++	c1.Close()
++	c2.Close()
++	err = <-errc
++	if err != nil {
++		t.Error("tear-down:", err)
++	}
++}
++
++func benchmarkTCPLoopback(chunkSize int64, b *testing.B, splice bool) {
++	c1, c2, err, errc := setupProxy("tcp", ":7002", splice)
++	if err != nil {
++		b.Fatal("setup:", err)
++	}
++	select {
++	case err = <-errc:
++		b.Fatal("setup:", err)
++	default:
++	}
++
++	var m sync.Mutex
++	m.Lock()
++	go func(c Conn, m *sync.Mutex) {
++		_, err := io.Copy(ioutil.Discard, c)
++		if err != nil {
++			b.Fatal("discard:", err)
++		}
++		m.Unlock()
++		c.Close()
++	}(c2, &m)
++
++	data := make([]byte, chunkSize)
++	b.SetBytes(chunkSize)
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		_, err := c1.Write(data)
++		if err != nil {
++			b.Fatal("write:", err)
++		}
++	}
++	c1.Close()
++	m.Lock()
++	b.StopTimer()
++	err = <-errc
++	if err != nil {
++		b.Fatal("teardown:", err)
++	}
++}
++
++func BenchmarkSplice1KBchunk(b *testing.B) {
++	benchmarkTCPLoopback(1024, b, true)
++}
++
++func BenchmarkSplice4KBchunk(b *testing.B) {
++	benchmarkTCPLoopback(4*1024, b, true)
++}
++
++func BenchmarkSplice64KBchunk(b *testing.B) {
++	benchmarkTCPLoopback(64*1024, b, true)
++}
++
++func BenchmarkCopy1KBchunk(b *testing.B) {
++	benchmarkTCPLoopback(1024, b, false)
++}
++
++func BenchmarkCopy4KBchunk(b *testing.B) {
++	benchmarkTCPLoopback(4*1024, b, false)
++}
++
++func BenchmarkCopy64KBchunk(b *testing.B) {
++	benchmarkTCPLoopback(64*1024, b, false)
++}
+-- 
+2.4.0
+
