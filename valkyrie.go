@@ -88,7 +88,7 @@ func (s *server) serve() error {
 func (s *server) assignId(c *conn) error {
 	s.connections.Lock()
 	for i := 0; i < 10; i++ {
-		id := rand.Uint32()
+		id := uint32(rand.Int31())
 		if s.c[id] == nil {
 			s.c[id] = c
 			s.connections.Unlock()
