@@ -15,9 +15,11 @@ Dependencies
 
 Required:
   - [Go](https://golang.org) 1.4+
+    NB: the `splice` patch is known to apply cleanly against Go 1.5, but may
+    or may not work well with subsequent versions.
 
 Optional:
-  - [golang-builder](https://github.com/aerofs/golang-builder)
+  - [gockerize](https://github.com/redbooth/gockerize)
     To build a minimal docker container <br/>
     Also useful to enable support for zero-copy via the `splice` syscall,
     which currently requires a patch to the standard library.
@@ -42,7 +44,8 @@ The Zephyr protocol is designed to allow secure communication between clients
 that are not able to establish a direct TCP connection.
 
 Peer discovery and connection negotiation are not part of the protocol and must
-happen out-of-band.
+happen out-of-band. For instance, [AeroFS](https://www.aerofs.com/) performs a
+3-way handshake over [SSMP](https://github.com/redbooth/ssmp).
 
 ## Identifier assignment
 
